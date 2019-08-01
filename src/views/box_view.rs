@@ -1,5 +1,6 @@
 use crate::vec::Vec2;
-use crate::view::{SizeConstraint, View, ViewWrapper};
+use crate::view::{Position, SizeConstraint, View, ViewWrapper};
+use crate::Printer;
 use crate::With;
 use crate::XY;
 
@@ -34,6 +35,11 @@ pub struct BoxView<T: View> {
     /// Set to `true` whenever we change some settings. Means we should re-layout just in case.
     invalidated: bool,
 
+    /// Position for wrapped view and internal state used for alignment calculations.
+    position: Option<Position>,
+    child_size: Vec2,
+    box_size: Vec2,
+
     /// The actual view we're wrapping.
     view: T,
 }
@@ -51,6 +57,9 @@ impl<T: View> BoxView<T> {
             size: (width, height).into(),
             squishable: false,
             invalidated: true,
+            position: None,
+            child_size: (0, 0).into(),
+            box_size: (0, 0).into(),
             view,
         }
     }
@@ -97,6 +106,24 @@ impl<T: View> BoxView<T> {
     pub fn set_squishable(&mut self, squishable: bool) {
         self.squishable = squishable;
         self.invalidate();
+    }
+
+    /// Sets position alignment for contents of `self`
+    ///
+    /// Position calculation is incompatible with `squishable` and
+    /// will be ignored if `squishable` is enabled.
+    ///
+    /// Returns `self`.
+    pub fn position(self, position: Position) -> Self {
+        self.with(|s| s.position = Some(position))
+    }
+
+    /// Sets position alignment for contents of `self`
+    ///
+    /// Position calculation is incompatible with `squishable` and
+    /// will be ignored if `squishable` is enabled.
+    pub fn set_position(&mut self, position: Position) {
+        self.position = Some(position);
     }
 
     /// Wraps `view` in a new `BoxView` with the given size.
@@ -235,7 +262,27 @@ impl<T: View> ViewWrapper for BoxView<T> {
             // Otherwise, take the child as squish attempt.
             respect_req.select_or(result, child_size)
         } else {
+            self.child_size = child_size;
+            self.box_size = result;
             result
+        }
+    }
+
+    fn wrap_draw(&self, printer: &Printer<'_, '_>) {
+        match (&self.position, self.squishable) {
+            (Some(position), false) => {
+                let offset = position.compute_offset(
+                    self.child_size,
+                    self.box_size,
+                    self.box_size,
+                );
+                let shinked = self
+                    .box_size
+                    .saturating_sub(self.child_size.saturating_add(offset));
+                let printer = printer.offset(offset).shrinked(shinked);
+                self.view.draw(&printer)
+            }
+            (_, _) => self.view.draw(printer),
         }
     }
 
@@ -256,7 +303,7 @@ mod tests {
     use crate::view::{Boxable, View};
     use crate::views::DummyView;
 
-    // No need to test `draw()` method as it's directly forwarded.
+    // TODO: test `draw()` method as well?
 
     #[test]
     fn min_size() {

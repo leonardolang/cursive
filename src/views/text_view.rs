@@ -1,4 +1,7 @@
+use std::cell::RefCell;
 use std::ops::Deref;
+use std::ptr;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard};
 
@@ -11,6 +14,9 @@ use crate::utils::lines::spans::{LinesIterator, Row};
 use crate::utils::markup::StyledString;
 use crate::view::{SizeCache, View};
 use crate::{Printer, Vec2, With, XY};
+
+// Content type used internally for caching and storage
+type InnerContentType = RefCell<Rc<StyledString>>;
 
 /// Provides access to the content of a [`TextView`].
 ///
@@ -42,11 +48,12 @@ impl TextContent {
     where
         S: Into<StyledString>,
     {
-        let content = content.into();
+        let content = Rc::new(content.into());
 
         TextContent {
             content: Arc::new(Mutex::new(TextContentInner {
-                content,
+                content_value: RefCell::new(content),
+                content_cache: RefCell::new(Rc::new(StyledString::default())),
                 size_cache: None,
             })),
         }
@@ -60,18 +67,22 @@ impl TextContent {
 /// [`StyledString`]: ../utils/markup/type.StyledString.html
 ///
 /// This keeps the content locked. Do not store this!
+
 pub struct TextContentRef {
-    handle: OwningHandle<
+    _handle: OwningHandle<
         ArcRef<Mutex<TextContentInner>>,
         MutexGuard<'static, TextContentInner>,
     >,
+    // We also need to keep a copy of Rc so `deref` can return
+    // a reference to the `StyledString`
+    data: Rc<StyledString>,
 }
 
 impl Deref for TextContentRef {
     type Target = StyledString;
 
     fn deref(&self) -> &StyledString {
-        &self.handle.content
+        self.data.as_ref()
     }
 }
 
@@ -81,7 +92,9 @@ impl TextContent {
     where
         S: Into<StyledString>,
     {
-        self.with_content(|c| *c = content.into());
+        self.with_content(|c| {
+            c.content_value.replace(Rc::new(content.into()))
+        });
     }
 
     /// Append `content` to the end of a `TextView`.
@@ -89,7 +102,17 @@ impl TextContent {
     where
         S: Into<StyledString>,
     {
-        self.with_content(|c| c.append(content))
+        self.with_content(|c| {
+            // This will only clone content if content_cached and content_value
+            // are sharing the same underlying Rc.
+            if c.is_content_shared() {
+                c.content_value
+                    .replace(Rc::new(c.get_value().as_ref().clone()));
+            };
+            Rc::get_mut(&mut c.content_value.borrow_mut())
+                .expect("should not have a shared content here")
+                .append(content)
+        })
     }
 
     /// Returns a reference to the content.
@@ -102,11 +125,11 @@ impl TextContent {
 
     fn with_content<F, O>(&mut self, f: F) -> O
     where
-        F: FnOnce(&mut StyledString) -> O,
+        F: FnOnce(&mut TextContentInner) -> O,
     {
         let mut lock = self.content.lock().unwrap();
 
-        let out = f(&mut lock.content);
+        let out = f(&mut lock);
 
         lock.size_cache = None;
 
@@ -121,7 +144,8 @@ impl TextContent {
 /// Can be shared (through a `Arc<Mutex>`).
 struct TextContentInner {
     // content: String,
-    content: StyledString,
+    content_value: InnerContentType,
+    content_cache: InnerContentType,
 
     // We keep the cache here so it can be busted when we change the content.
     size_cache: Option<XY<SizeCache>>,
@@ -133,11 +157,13 @@ impl TextContentInner {
         let arc_ref: ArcRef<Mutex<TextContentInner>> =
             ArcRef::new(Arc::clone(content));
 
-        TextContentRef {
-            handle: OwningHandle::new_with_fn(arc_ref, |mutex| unsafe {
-                (*mutex).lock().unwrap()
-            }),
-        }
+        let _handle = OwningHandle::new_with_fn(arc_ref, |mutex| unsafe {
+            (*mutex).lock().unwrap()
+        });
+
+        let data = _handle.get_value();
+
+        TextContentRef { _handle, data }
     }
 
     fn is_cache_valid(&self, size: Vec2) -> bool {
@@ -145,6 +171,18 @@ impl TextContentInner {
             None => false,
             Some(ref last) => last.x.accept(size.x) && last.y.accept(size.y),
         }
+    }
+
+    fn get_value(&self) -> Rc<StyledString> {
+        Rc::clone(&*self.content_value.borrow())
+    }
+
+    fn get_cache(&self) -> Rc<StyledString> {
+        Rc::clone(&*self.content_cache.borrow())
+    }
+
+    fn is_content_shared(&self) -> bool {
+        ptr::eq(self.get_value().as_ref(), self.get_cache().as_ref())
     }
 }
 
@@ -161,7 +199,7 @@ impl TextContentInner {
 /// ```
 pub struct TextView {
     // content: String,
-    content: Arc<Mutex<TextContentInner>>,
+    content: TextContent,
     rows: Vec<Row>,
 
     align: Align,
@@ -202,7 +240,7 @@ impl TextView {
     /// ```
     pub fn new_with_content(content: TextContent) -> Self {
         TextView {
-            content: content.content,
+            content: content,
             effect: Effect::Simple,
             rows: Vec::new(),
             wrap: true,
@@ -285,8 +323,7 @@ impl TextView {
     where
         S: Into<StyledString>,
     {
-        self.content.lock().unwrap().content = content.into();
-        self.invalidate();
+        self.content.set_content(content);
     }
 
     /// Append `content` to the end of a `TextView`.
@@ -294,22 +331,20 @@ impl TextView {
     where
         S: Into<StyledString>,
     {
-        self.content.lock().unwrap().content.append(content.into());
-        self.invalidate();
+        self.content.append(content);
     }
 
     /// Returns the current text in this view.
     pub fn get_content(&self) -> TextContentRef {
-        TextContentInner::get_content(&self.content)
+        TextContentInner::get_content(&self.content.content)
     }
 
     /// Returns a shared reference to the content, allowing content mutation.
     pub fn get_shared_content(&mut self) -> TextContent {
         // We take &mut here without really needing it,
         // because it sort of "makes sense".
-
         TextContent {
-            content: Arc::clone(&self.content),
+            content: Arc::clone(&self.content.content),
         }
     }
 
@@ -318,7 +353,7 @@ impl TextView {
     fn compute_rows(&mut self, size: Vec2) {
         let size = if self.wrap { size } else { Vec2::max_value() };
 
-        let mut content = self.content.lock().unwrap();
+        let mut content = self.content.content.lock().unwrap();
         if content.is_cache_valid(size) {
             return;
         }
@@ -326,22 +361,20 @@ impl TextView {
         // Completely bust the cache
         // Just in case we fail, we don't want to leave a bad cache.
         content.size_cache = None;
+        content
+            .content_cache
+            .replace(content.content_value.borrow().clone());
 
         if size.x == 0 {
             // Nothing we can do at this point.
             return;
         }
 
-        self.rows = LinesIterator::new(&content.content, size.x).collect();
+        self.rows =
+            LinesIterator::new(content.get_cache().as_ref(), size.x).collect();
 
         // Desired width
         self.width = self.rows.iter().map(|row| row.width).max();
-    }
-
-    // Invalidates the cache, so next call will recompute everything.
-    fn invalidate(&mut self) {
-        let mut content = self.content.lock().unwrap();
-        content.size_cache = None;
     }
 }
 
@@ -352,14 +385,14 @@ impl View for TextView {
         let offset = self.align.v.get_offset(h, printer.size.y);
         let printer = &printer.offset((0, offset));
 
-        let content = self.content.lock().unwrap();
+        let content = self.content.content.lock().unwrap();
 
         printer.with_effect(self.effect, |printer| {
             for (y, row) in self.rows.iter().enumerate() {
                 let l = row.width;
                 let mut x = self.align.h.get_offset(l, printer.size.x);
 
-                for span in row.resolve(&content.content) {
+                for span in row.resolve(content.get_cache().as_ref()) {
                     printer.with_style(*span.attr, |printer| {
                         printer.print((x, y), span.content);
                         x += span.content.width();
@@ -370,7 +403,7 @@ impl View for TextView {
     }
 
     fn needs_relayout(&self) -> bool {
-        let content = self.content.lock().unwrap();
+        let content = self.content.content.lock().unwrap();
         content.size_cache.is_none()
     }
 
@@ -389,7 +422,7 @@ impl View for TextView {
         let my_size = Vec2::new(self.width.unwrap_or(0), self.rows.len());
 
         // Build a fresh cache.
-        let mut content = self.content.lock().unwrap();
+        let mut content = self.content.content.lock().unwrap();
         content.size_cache = Some(SizeCache::build(my_size, size));
     }
 }

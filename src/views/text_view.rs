@@ -43,10 +43,12 @@ impl TextContent {
         S: Into<StyledString>,
     {
         let content = content.into();
+        let content_cache = content.clone();
 
         TextContent {
             content: Arc::new(Mutex::new(TextContentInner {
                 content,
+                content_cache,
                 size_cache: None,
             })),
         }
@@ -122,6 +124,9 @@ impl TextContent {
 struct TextContentInner {
     // content: String,
     content: StyledString,
+
+    // We cache the last string we used for calculating sizes.
+    content_cache: StyledString,
 
     // We keep the cache here so it can be busted when we change the content.
     size_cache: Option<XY<SizeCache>>,
@@ -326,13 +331,14 @@ impl TextView {
         // Completely bust the cache
         // Just in case we fail, we don't want to leave a bad cache.
         content.size_cache = None;
+        content.content_cache = content.content.clone();
 
         if size.x == 0 {
             // Nothing we can do at this point.
             return;
         }
 
-        self.rows = LinesIterator::new(&content.content, size.x).collect();
+        self.rows = LinesIterator::new(&content.content_cache, size.x).collect();
 
         // Desired width
         self.width = self.rows.iter().map(|row| row.width).max();
@@ -359,7 +365,7 @@ impl View for TextView {
                 let l = row.width;
                 let mut x = self.align.h.get_offset(l, printer.size.x);
 
-                for span in row.resolve(&content.content) {
+                for span in row.resolve(&content.content_cache) {
                     printer.with_style(*span.attr, |printer| {
                         printer.print((x, y), span.content);
                         x += span.content.width();
